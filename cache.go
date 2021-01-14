@@ -28,7 +28,7 @@ type (
 		loaders map[string]DataLoader
 		cfg     CacheConfig
 		version map[string]int64
-		updates chan string
+		updates chan versionInfo
 		stop    chan struct{}
 		locker  *redislock.Client
 	}
@@ -42,6 +42,11 @@ type (
 		CleanupInterval time.Duration
 		LockInterval    time.Duration
 		MaxUpdateBuffer int
+	}
+
+	versionInfo struct {
+		dataKey   string
+		versionNo int64
 	}
 )
 
@@ -68,12 +73,15 @@ func (p *CacheConfig) checkAndLoadDefault() error {
 }
 
 func New(cfg CacheConfig) (*levelCache, error) {
+	if err := cfg.checkAndLoadDefault(); err != nil {
+		return nil, err
+	}
 	lc := &levelCache{
 		c:       cache.New(cfg.CacheExpiration, cfg.CleanupInterval),
 		loaders: make(map[string]DataLoader),
 		cfg:     cfg,
 		version: make(map[string]int64),
-		updates: make(chan string, cfg.MaxUpdateBuffer),
+		updates: make(chan versionInfo, cfg.MaxUpdateBuffer),
 		stop:    make(chan struct{}, 1),
 	}
 	rdb := redis.NewClient(&redis.Options{
@@ -84,6 +92,7 @@ func New(cfg CacheConfig) (*levelCache, error) {
 	if err := rdb.Ping(context.TODO()).Err(); err != nil {
 		return nil, err
 	}
+	lc.rdb = rdb
 	lc.locker = redislock.New(rdb)
 	return lc, nil
 }
@@ -108,8 +117,8 @@ func (p *levelCache) Start(ctx context.Context) {
 	go func() {
 		for {
 			select {
-			case k := <-p.updates:
-				_ = p.parseAndDo(ctx, k)
+			case update := <-p.updates:
+				_ = p.parseAndDo(ctx, update)
 			case <-p.stop:
 				close(p.stop)
 				close(p.updates)
@@ -139,7 +148,7 @@ func (p *levelCache) get(ctx context.Context, key string, obj Cacheable) error {
 	}
 
 	// read redis cache
-	content, err := p.rdb.Get(ctx, key).Result()
+	content, err := p.rdb.Get(ctx, k).Result()
 	if err != nil && err != redis.Nil {
 		return err
 	}
@@ -147,7 +156,7 @@ func (p *levelCache) get(ctx context.Context, key string, obj Cacheable) error {
 		if err := jsoniter.UnmarshalFromString(content, obj); err != nil {
 			return err
 		}
-		p.c.SetDefault(k, jsonString(obj))
+		p.c.SetDefault(k, toJson(obj))
 	}
 
 	loader, exist := p.loaders[obj.Namespace()]
@@ -161,8 +170,8 @@ func (p *levelCache) get(ctx context.Context, key string, obj Cacheable) error {
 	if err := copier.Copy(obj, data); err != nil {
 		return err
 	}
-	p.rdb.Set(ctx, k, jsonString(obj), p.cfg.CacheExpiration)
-	p.c.SetDefault(k, jsonString(obj))
+	p.rdb.Set(ctx, k, toJson(obj), p.cfg.CacheExpiration)
+	p.c.SetDefault(k, toJson(obj))
 	if _, ok := p.version[k]; !ok {
 		p.version[k] = 0
 	}
@@ -184,16 +193,20 @@ func (p *levelCache) checkCacheUpdate(ctx context.Context, namespace, key string
 		return
 	}
 	if latest != current {
-		p.updates <- k
+		p.updates <- versionInfo{
+			dataKey:   k,
+			versionNo: latest,
+		}
 	}
 }
 
-func (p *levelCache) parseAndDo(ctx context.Context, k string) error {
-	content, err := p.rdb.Get(ctx, k).Result()
+func (p *levelCache) parseAndDo(ctx context.Context, info versionInfo) error {
+	content, err := p.rdb.Get(ctx, info.dataKey).Result()
 	if err != nil {
 		return err
 	}
-	p.c.SetDefault(k, content)
+	p.version[info.dataKey] = info.versionNo
+	p.c.SetDefault(info.dataKey, content)
 	return nil
 }
 
@@ -205,20 +218,20 @@ func (p *levelCache) Refresh(ctx context.Context, namespace, key string) {
 	go func() {
 		k := jointKey(namespace, key)
 		lockKey := jointKey("lock", k)
+		vk := jointKey("version", k)
 		for {
 			lock, err := p.locker.Obtain(ctx, lockKey, p.cfg.LockInterval, nil)
 			if err != nil {
 				time.Sleep(time.Millisecond)
 				continue
 			}
-
 			data, err := loader(ctx, key)
 			if err != nil {
 				return
 			}
-			p.c.SetDefault(k, jsonString(data))
-			p.rdb.Set(ctx, k, jsonString(data), p.cfg.CacheExpiration)
-			vk := jointKey("version", k)
+			p.c.SetDefault(k, toJson(data))
+			p.rdb.Set(ctx, k, toJson(data), p.cfg.CacheExpiration)
+
 			if recNo, err := p.rdb.Incr(ctx, vk).Result(); err == nil {
 				p.version[k] = recNo
 			}
@@ -231,7 +244,8 @@ func (p *levelCache) Refresh(ctx context.Context, namespace, key string) {
 func jointKey(a ...string) string {
 	return strings.Join(a, cacheKeyJoint)
 }
-func jsonString(obj interface{}) string {
+
+func toJson(obj interface{}) string {
 	content, err := jsoniter.MarshalToString(obj)
 	if err != nil {
 		return ""
